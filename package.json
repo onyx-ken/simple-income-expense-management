@@ -1,0 +1,46 @@
+{
+  "name": "et-am",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start:dev": "concurrently \"cd frontend && npm run dev\" \"cross-env NODE_ENV=development electron .\"",
+    "start:prod": "cross-env NODE_ENV=production electron .",
+    "start:electron": " electron .",
+    "build:frontend": "cd frontend && npm run build",
+    "build:electron": "electron-builder",
+    "build": "npm run build:frontend && npm run build:electron"
+  },
+  "build": {
+    "appId": "onyx.income-sepend-manager",
+    "productName": "IncomeAndSependManagerApp",
+    "asar": false,
+    "directories": {
+      "output": "dist_electron"
+    },
+    "files": [
+      "main.js",
+      "backend/**",
+      "frontend/build/**"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "build/icon.icns"
+    }
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "create-svelte": "^7.0.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "node-adodb": "^5.0.3",
+    "print-js": "^1.6.0"
+  }
+}
