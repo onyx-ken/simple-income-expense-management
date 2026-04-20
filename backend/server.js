@@ -1,11 +1,13 @@
 const express = require('express');
 const ADODB = require('node-adodb');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // 1) Express 앱 생성
 const app = express();
 // JSON 바디 파싱 (POST 요청 시 body에 JSON 받을 수 있게 함)
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 // 2) MDB 연결 문자열 설정
 // 파일 경로에 주의: \ 대신 / 또는 \\ 로 써야 합니다.
@@ -699,6 +701,100 @@ app.post('/api/addSubject', async (req, res) => {
     }
 });
 
+app.post('/api/parseBankExcel', async (req, res) => {
+    let tempFilePath;
+
+    try {
+        const { fileName, fileBase64, targetType } = req.body;
+        const { opYear } = req.query;
+
+        if (!fileName || !fileBase64 || !['income', 'spending'].includes(targetType)) {
+            return res.status(400).json({ message: '엑셀 파일과 입력 종류가 필요합니다.' });
+        }
+
+        const fileBuffer = Buffer.from(fileBase64, 'base64');
+        const extension = path.extname(fileName).toLowerCase() || '.xls';
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'et-am-bank-'));
+        tempFilePath = path.join(tempDir, `upload${extension}`);
+        fs.writeFileSync(tempFilePath, fileBuffer);
+
+        const excelRows = await readExcelRows(tempFilePath);
+        const parsed = parseBankStatementRows(excelRows);
+        const connection = getConnection(opYear);
+        const budgetSubjects = await fetchBudgetSubjects(connection, targetType);
+        const existingRows = await fetchExistingLedgerRows(connection, targetType);
+        const rows = buildBankImportRows(parsed.transactions, targetType, parsed.accountNumber, budgetSubjects, existingRows);
+
+        res.status(200).json({
+            fileName,
+            accountNumber: parsed.accountNumber,
+            totalCount: parsed.transactions.length,
+            importableCount: rows.filter(row => row.status === 'ready').length,
+            reviewCount: rows.filter(row => row.status === 'needs_review').length,
+            skippedCount: rows.filter(row => row.status === 'skip').length,
+            subjectsByAccount: budgetSubjects,
+            rows
+        });
+    } catch (error) {
+        console.error('엑셀 분석 오류:', error);
+        res.status(500).json({ message: '엑셀 파일을 분석하는 중 오류가 발생했습니다.', details: String(error) });
+    } finally {
+        if (tempFilePath) {
+            try {
+                fs.rmSync(path.dirname(tempFilePath), { recursive: true, force: true });
+            } catch (cleanupError) {
+                console.error('임시 엑셀 파일 삭제 오류:', cleanupError);
+            }
+        }
+    }
+});
+
+app.post('/api/importBankExcelRows', async (req, res) => {
+    try {
+        const { rows, targetType } = req.body;
+        const { opYear } = req.query;
+
+        if (!Array.isArray(rows) || !['income', 'spending'].includes(targetType)) {
+            return res.status(400).json({ message: '입력할 거래 목록이 필요합니다.' });
+        }
+
+        const connection = getConnection(opYear);
+        const existingRows = await fetchExistingLedgerRows(connection, targetType);
+        let insertedCount = 0;
+        let skippedCount = 0;
+        const errors = [];
+
+        for (const row of rows) {
+            const normalized = normalizeImportRow(row);
+
+            if (!normalized) {
+                skippedCount += 1;
+                errors.push({ rowId: row?.id, message: '필수 값이 빠진 행입니다.' });
+                continue;
+            }
+
+            if (findExactExistingRow(normalized, existingRows)) {
+                skippedCount += 1;
+                continue;
+            }
+
+            try {
+                await connection.execute(buildLedgerInsertQuery(normalized, targetType));
+                existingRows.push(normalized);
+                insertedCount += 1;
+            } catch (insertError) {
+                skippedCount += 1;
+                errors.push({ rowId: row?.id, message: String(insertError) });
+            }
+        }
+
+        res.status(200).json({ insertedCount, skippedCount, errors });
+    } catch (error) {
+        console.error('엑셀 일괄 입력 오류:', error);
+        res.status(500).json({ message: '거래 내역을 입력하는 중 오류가 발생했습니다.', details: String(error) });
+    }
+});
+
 function formatDateForJSON(rows) {
     return rows.map(row => {
         if (row.날짜) {
@@ -722,6 +818,572 @@ function processDescription(subject, description) {
         return description.replace(keywordRegex, '').trim();
     }
     return description; // 괄호가 없으면 기존 값 유지
+}
+
+function openExcelConnection(filePath) {
+    const extension = path.extname(filePath).toLowerCase();
+    const excelType = extension === '.xlsx' ? 'Excel 12.0 Xml' : 'Excel 8.0';
+    const providerString = `Provider=Microsoft.ACE.OLEDB.${providerVersion};Data Source=${filePath};Extended Properties="${excelType};HDR=NO;IMEX=1";`;
+    return ADODB.open(providerString, isX64);
+}
+
+async function readExcelRows(filePath) {
+    const connection = openExcelConnection(filePath);
+    const sheetNames = await getExcelSheetNames(connection);
+    let lastError;
+
+    for (const sheetName of sheetNames) {
+        try {
+            const escapedSheetName = String(sheetName).replace(/]/g, ']]');
+            const rows = await connection.query(`SELECT * FROM [${escapedSheetName}]`);
+            if (Array.isArray(rows) && rows.length > 0) {
+                return rows;
+            }
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    throw lastError || new Error('엑셀 시트를 찾을 수 없습니다.');
+}
+
+async function getExcelSheetNames(connection) {
+    try {
+        const schemaRows = await connection.schema(20);
+        const names = schemaRows
+            .map(row => row.TABLE_NAME || row.table_name)
+            .filter(name => name && String(name).includes('$'));
+
+        if (names.length > 0) {
+            return names;
+        }
+    } catch (error) {
+        console.warn('엑셀 시트 목록 조회 실패, 기본 시트명으로 재시도합니다:', error);
+    }
+
+    return ['Sheet0$', 'Sheet1$'];
+}
+
+function parseBankStatementRows(rows) {
+    const headerIndex = rows.findIndex(row => Object.values(row).some(value => cleanCell(value).includes('거래일자')));
+    const headerRow = headerIndex >= 0 ? rows[headerIndex] : {};
+    const keys = {
+        sequence: findColumnKey(headerRow, '구분') || 'F1',
+        date: findColumnKey(headerRow, '거래일자') || 'F2',
+        withdrawal: findColumnKey(headerRow, '출금금액') || 'F3',
+        deposit: findColumnKey(headerRow, '입금금액') || 'F4',
+        balance: findColumnKey(headerRow, '거래 후 잔액') || 'F5',
+        content: findColumnKey(headerRow, '거래내용') || 'F6',
+        record: findColumnKey(headerRow, '거래기록사항') || 'F7',
+        branch: findColumnKey(headerRow, '거래점') || 'F8',
+        time: findColumnKey(headerRow, '거래시간') || 'F9',
+        memo: 'F10'
+    };
+    const accountNumber = findAccountNumber(rows);
+    const sourceRows = headerIndex >= 0 ? rows.slice(headerIndex + 1) : rows;
+
+    const transactions = sourceRows
+        .map((row, index) => {
+            const date = normalizeBankDate(row[keys.date]);
+            const sequence = cleanCell(row[keys.sequence]);
+            const withdrawal = parseWon(row[keys.withdrawal]);
+            const deposit = parseWon(row[keys.deposit]);
+
+            if (!date || (!withdrawal && !deposit)) {
+                return null;
+            }
+
+            return {
+                id: `${date}-${sequence || index + 1}-${withdrawal || deposit}`,
+                rowNumber: index + 1,
+                sequence,
+                date,
+                withdrawal,
+                deposit,
+                amount: deposit || withdrawal,
+                direction: deposit > 0 ? 'income' : 'spending',
+                balance: parseWon(row[keys.balance]),
+                content: cleanCell(row[keys.content]),
+                record: cleanCell(row[keys.record]),
+                branch: cleanCell(row[keys.branch]),
+                time: cleanCell(row[keys.time]),
+                memo: cleanCell(row[keys.memo])
+            };
+        })
+        .filter(Boolean);
+
+    return { accountNumber, transactions };
+}
+
+function findColumnKey(headerRow, label) {
+    return Object.entries(headerRow).find(([, value]) => cleanCell(value).includes(label))?.[0];
+}
+
+function findAccountNumber(rows) {
+    for (const row of rows) {
+        for (const value of Object.values(row)) {
+            const text = cleanCell(value);
+            const match = text.match(/\d{3}-[\d-]+/);
+            if (match) {
+                return match[0];
+            }
+        }
+    }
+    return '';
+}
+
+async function fetchBudgetSubjects(connection, targetType) {
+    const typeName = targetType === 'income' ? '수입' : '지출';
+    const rows = await connection.query(`
+        SELECT 계정, 과목
+        FROM 예산
+        WHERE 수입지출 = '${typeName}'
+        AND 과목 IS NOT NULL
+        ORDER BY 계정, 번호, id
+    `);
+
+    return rows.reduce((acc, row) => {
+        if (!row.계정 || !row.과목) {
+            return acc;
+        }
+
+        if (!acc[row.계정]) {
+            acc[row.계정] = [];
+        }
+        acc[row.계정].push(row.과목);
+        return acc;
+    }, {});
+}
+
+async function fetchExistingLedgerRows(connection, targetType) {
+    const tableName = targetType === 'income' ? '수입' : '지출';
+    const titleField = targetType === 'income' ? '이름' : '적요';
+    const rows = await connection.query(`
+        SELECT 날짜, 계정, 과목, ${titleField} AS 제목, 금액
+        FROM ${tableName}
+    `);
+
+    return rows.map(row => ({
+        date: normalizeDbDate(row.날짜),
+        account: cleanCell(row.계정),
+        subject: cleanCell(row.과목),
+        title: cleanCell(row.제목),
+        amount: Number(row.금액) || 0
+    }));
+}
+
+function buildBankImportRows(transactions, targetType, accountNumber, budgetSubjects, existingRows) {
+    return transactions.map(transaction => {
+        const row = buildBankImportRow(transaction, targetType, accountNumber, budgetSubjects, existingRows);
+        return {
+            ...row,
+            selected: row.status === 'ready'
+        };
+    });
+}
+
+function buildBankImportRow(transaction, targetType, accountNumber, budgetSubjects, existingRows) {
+    const raw = {
+        accountNumber,
+        sequence: transaction.sequence,
+        withdrawal: transaction.withdrawal,
+        deposit: transaction.deposit,
+        balance: transaction.balance,
+        content: transaction.content,
+        record: transaction.record,
+        branch: transaction.branch,
+        time: transaction.time,
+        memo: transaction.memo
+    };
+
+    if (transaction.direction !== targetType) {
+        return {
+            id: transaction.id,
+            status: 'skip',
+            reason: targetType === 'income' ? '출금 거래라 수입 입력에서 제외' : '입금 거래라 지출 입력에서 제외',
+            date: transaction.date,
+            account: '',
+            subject: '',
+            title: transaction.record || transaction.content,
+            amount: transaction.amount,
+            raw
+        };
+    }
+
+    const transferReason = getInternalTransferReason(transaction, accountNumber);
+    if (transferReason) {
+        return {
+            id: transaction.id,
+            status: 'skip',
+            reason: transferReason,
+            date: transaction.date,
+            account: '',
+            subject: '',
+            title: transaction.record || transaction.content,
+            amount: transaction.amount,
+            raw
+        };
+    }
+
+    const guessed = targetType === 'income'
+        ? guessIncomeRow(transaction, accountNumber)
+        : guessSpendingRow(transaction, accountNumber);
+
+    const matchedExisting = findSimilarExistingRow(transaction, guessed, existingRows);
+    const row = matchedExisting
+        ? {
+            ...guessed,
+            account: matchedExisting.account,
+            subject: matchedExisting.subject,
+            title: matchedExisting.title,
+            reason: guessed.reason || '기존 입력과 같은 날짜/금액/내용 패턴'
+        }
+        : guessed;
+
+    row.date = transaction.date;
+    row.amount = transaction.amount;
+    row.raw = raw;
+    row.id = transaction.id;
+
+    if (!isBudgetSubject(row.account, row.subject, budgetSubjects)) {
+        row.status = 'needs_review';
+        row.reason = row.reason || '예산에 없는 계정/과목이라 확인 필요';
+    }
+
+    if (findExactExistingRow(row, existingRows)) {
+        row.status = 'skip';
+        row.reason = '이미 입력된 거래';
+    }
+
+    return row;
+}
+
+function guessIncomeRow(transaction, accountNumber) {
+    const fullText = buildTransactionText(transaction);
+    const record = transaction.record || transaction.memo || transaction.content;
+    const isAccount355 = String(accountNumber).startsWith('355');
+    let account = '일반';
+    let subject = '감사헌금';
+    let status = 'ready';
+    let reason = '';
+
+    if (includesAny(fullText, ['건축헌금', '건축'])) {
+        account = '건축';
+        subject = '건축헌금';
+    } else if (includesAny(fullText, ['신년'])) {
+        subject = '신년감사헌금';
+    } else if (includesAny(fullText, ['부활', '부활주일', '부활감사'])) {
+        subject = '부활절헌금';
+    } else if (includesAny(fullText, ['맥추'])) {
+        subject = '맥추감사헌금';
+    } else if (includesAny(fullText, ['추수'])) {
+        subject = '추수감사헌금';
+    } else if (includesAny(fullText, ['성탄'])) {
+        subject = '성탄감사헌금';
+    } else if (includesAny(fullText, ['음향', '앰프'])) {
+        subject = '음향개선헌금';
+    } else if (includesAny(fullText, ['차량'])) {
+        subject = '차량헌금';
+    } else if (includesAny(fullText, ['선교'])) {
+        subject = '선교헌금';
+    } else if (includesAny(fullText, ['십일조']) || /십\s*$/.test(record)) {
+        subject = '십일조헌금';
+    } else if (includesAny(fullText, ['주일헌금'])) {
+        subject = '주일헌금';
+    } else if (includesAny(fullText, ['겨울캠프', '캠프후원'])) {
+        subject = '교회학교헌금';
+    } else if (includesAny(fullText, ['예금이자', '이자', 'NH체크할인', '체크할인', '반찬나눔'])) {
+        subject = '기타헌금';
+    }
+
+    const isClearBankIncome = includesAny(fullText, ['예금이자', '이자', 'NH체크할인', '체크할인']);
+
+    if (isAccount355 && !isClearBankIncome) {
+        status = 'needs_review';
+        reason = '355 계좌 입금은 헌금 합계 또는 환급일 수 있어 확인 필요';
+    }
+
+    if (isAccount355 && includesAny(fullText, ['일반헌금'])) {
+        subject = '주일헌금';
+        status = 'needs_review';
+        reason = '통장에는 일반헌금 합계로 표시되어 과목 확인 필요';
+    }
+
+    if (includesAny(fullText, ['예금이자', '이자'])) {
+        return { account, subject: '기타헌금', title: '예금이자(통장)', status, reason };
+    }
+
+    if (includesAny(fullText, ['NH체크할인', '체크할인'])) {
+        return { account, subject: '기타헌금', title: '체크 할인', status, reason };
+    }
+
+    const title = makeIncomeTitle(record, subject);
+    return { account, subject, title, status, reason };
+}
+
+function guessSpendingRow(transaction) {
+    const fullText = buildTransactionText(transaction);
+    let account = '일반';
+    let subject = '관리유지비';
+    let status = 'ready';
+    let reason = '';
+
+    if (includesAny(fullText, ['대출원금'])) {
+        account = '건축';
+        subject = '대출원금';
+    } else if (includesAny(fullText, ['대출금 이자', '대출이자'])) {
+        account = '건축';
+        subject = '대출금 이자';
+    } else if (includesAny(fullText, ['퇴직적립'])) {
+        subject = '퇴직적립금';
+    } else if (includesAny(fullText, ['사회보험'])) {
+        subject = '사회보험료';
+    } else if (includesAny(fullText, ['선교비'])) {
+        subject = '선교사업비';
+    } else if (includesAny(fullText, ['부담금'])) {
+        subject = '부담금';
+    } else if (includesAny(fullText, ['연회등록', '등록비', '부목사 연회', '성경선물', '사무용품', '문구', '종이컵', '임명장', '우편', '헌금봉투'])) {
+        subject = '사무행정비';
+    } else if (includesAny(fullText, ['식대', '식사', '마트', '송편', '전도', '꽃', '심방', '병원', '장례', '조의금', '부활절계란', '사탕', '금관유통', '초청', '협찬'])) {
+        subject = '문화사업비';
+    }
+
+    if (includesAny(fullText, ['헌금']) && !includesAny(fullText, ['헌금봉투', '헌금꽂이'])) {
+        status = 'needs_review';
+        reason = '헌금 관련 출금이라 지출 여부 확인 필요';
+    }
+
+    return {
+        account,
+        subject,
+        title: makeSpendingTitle(transaction),
+        status,
+        reason
+    };
+}
+
+function makeIncomeTitle(record, subject) {
+    let title = cleanCell(record) || '통장입금';
+    title = title.replace(/[\/_-]+/g, ' ');
+
+    const removableWords = [
+        subject,
+        '헌금',
+        '십일조',
+        '십',
+        '건축',
+        '선교',
+        '신년',
+        '감사',
+        '부활주일',
+        '부활감사',
+        '부활',
+        '맥추',
+        '추수',
+        '성탄',
+        '음향개선',
+        '음향기기',
+        '음향',
+        '앰프목적',
+        '앰프개선',
+        '앰프',
+        '차량구입',
+        '차량',
+        '주일'
+    ];
+
+    for (const word of removableWords) {
+        if (word) {
+            title = title.replace(new RegExp(escapeRegExp(word), 'g'), '');
+        }
+    }
+
+    title = normalizeKnownName(title.trim()) || cleanCell(record) || '통장입금';
+
+    if (!includesAny(title, ['통장', '이자', '할인', '헌금'])) {
+        title = `${title}(통장)`;
+    }
+
+    return title;
+}
+
+function makeSpendingTitle(transaction) {
+    const text = buildTransactionText(transaction);
+    const record = transaction.record || transaction.memo || transaction.content || '통장출금';
+
+    if (includesAny(text, ['청양에너지', '충전소', '주유소', 'LPG'])) return '차량 주유비';
+    if (includesAny(text, ['대영철물', '예림철물', '철물건재'])) return '철물';
+    if (includesAny(text, ['사무용가구', '가구리퍼'])) return '사무용가구';
+    if (includesAny(text, ['KB손', '보험료'])) return '보험료';
+    if (includesAny(text, ['강내농업협동조합하나로마트', '하나로마트'])) return '하나로마트';
+    if (includesAny(text, ['모싯잎송편'])) return '모싯잎송편';
+    if (includesAny(text, ['금관유통'])) return '금관마트';
+    if (includesAny(text, ['전도용사탕', '전도용품'])) return '전도용품';
+    if (includesAny(text, ['6구 스위치'])) return '6구 스위치';
+    if (includesAny(text, ['소화기'])) return '소화기2개,폐기물스티커';
+    if (includesAny(text, ['전기요금'])) return '전기요금';
+    if (includesAny(text, ['수도'])) return '수도료';
+    if (includesAny(text, ['전화', 'KT'])) return '전화요금';
+    if (includesAny(text, ['퇴직적립'])) return '퇴직적립금';
+    if (includesAny(text, ['사회보험'])) return '담임목사 사회보험료';
+    if (includesAny(text, ['선교비'])) return record.replace(/([가-힣]{2,4})선교비/g, '$1 선교비').trim();
+    if (includesAny(text, ['주일식'])) return '주일 식대 지원';
+
+    return record.trim();
+}
+
+function getInternalTransferReason(transaction, accountNumber) {
+    const fullText = buildTransactionText(transaction);
+    const account = String(accountNumber);
+
+    if (account.startsWith('306') && transaction.withdrawal > 0 && includesAny(fullText, ['만나교회'])) {
+        return '306 계좌에서 355 계좌로 옮긴 내부 이체';
+    }
+
+    if (account.startsWith('355') && transaction.deposit > 0 && includesAny(fullText, ['기독교대한감리회만나', '만나교회'])) {
+        return '306 계좌에서 355 계좌로 들어온 내부 이체';
+    }
+
+    return '';
+}
+
+function findSimilarExistingRow(transaction, guessed, existingRows) {
+    const rawTitle = targetTitleKey(transaction.record || transaction.memo || transaction.content);
+    const candidates = existingRows.filter(row => row.date === transaction.date && row.amount === transaction.amount);
+
+    if (rawTitle) {
+        const titleMatches = candidates.filter(row => {
+            const dbTitle = targetTitleKey(row.title);
+            return dbTitle.includes(rawTitle) || rawTitle.includes(dbTitle);
+        });
+
+        if (titleMatches.length === 1) {
+            return titleMatches[0];
+        }
+    }
+
+    const subjectMatches = candidates.filter(row => row.account === guessed.account && row.subject === guessed.subject);
+    return subjectMatches.length === 1 ? subjectMatches[0] : null;
+}
+
+function findExactExistingRow(row, existingRows) {
+    return existingRows.find(existing => (
+        existing.date === row.date
+        && existing.amount === Number(row.amount)
+        && existing.account === cleanCell(row.account)
+        && existing.subject === cleanCell(row.subject)
+        && targetTitleKey(existing.title) === targetTitleKey(row.title)
+    ));
+}
+
+function normalizeImportRow(row) {
+    const date = normalizeBankDate(row?.date);
+    const amount = parseWon(row?.amount);
+    const account = cleanCell(row?.account);
+    const subject = cleanCell(row?.subject);
+    const title = cleanCell(row?.title);
+
+    if (!date || !amount || !account || !subject || !title) {
+        return null;
+    }
+
+    return { date, amount, account, subject, title };
+}
+
+function buildLedgerInsertQuery(row, targetType) {
+    if (targetType === 'income') {
+        return `
+            INSERT INTO 수입 (계정, 과목, 이름, 금액, 날짜)
+            VALUES ('${escapeSql(row.account)}', '${escapeSql(row.subject)}', '${escapeSql(row.title)}', ${row.amount}, #${row.date}#)
+        `;
+    }
+
+    const processedDescription = processDescription(row.subject, row.title);
+    return `
+        INSERT INTO 지출 (계정, 과목, 적요, 금액, 날짜)
+        VALUES ('${escapeSql(row.account)}', '${escapeSql(row.subject)}', '${escapeSql(processedDescription)}', ${row.amount}, #${row.date}#)
+    `;
+}
+
+function isBudgetSubject(account, subject, budgetSubjects) {
+    return Array.isArray(budgetSubjects[account]) && budgetSubjects[account].includes(subject);
+}
+
+function buildTransactionText(transaction) {
+    return [transaction.content, transaction.record, transaction.memo, transaction.branch]
+        .map(cleanCell)
+        .filter(Boolean)
+        .join(' ');
+}
+
+function normalizeBankDate(value) {
+    if (!value) return '';
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return new Date(value.getTime() - value.getTimezoneOffset() * 60000).toISOString().split('T')[0];
+    }
+
+    const text = cleanCell(value);
+    const match = text.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})/);
+    if (!match) return '';
+
+    const [, year, month, day] = match;
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
+function normalizeDbDate(value) {
+    if (!value) return '';
+    const date = new Date(value);
+
+    if (!Number.isNaN(date.getTime())) {
+        return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().split('T')[0];
+    }
+
+    return normalizeBankDate(value);
+}
+
+function parseWon(value) {
+    if (value === null || value === undefined || value === '') return 0;
+    const number = Number(String(value).replace(/[^\d.-]/g, ''));
+    return Number.isFinite(number) ? Math.round(number) : 0;
+}
+
+function cleanCell(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function includesAny(text, words) {
+    return words.some(word => cleanCell(text).includes(word));
+}
+
+function targetTitleKey(value) {
+    return cleanCell(value)
+        .replace(/\(통장\)/g, '')
+        .replace(/[()\s/_-]/g, '')
+        .replace(/헌금/g, '')
+        .trim();
+}
+
+function normalizeKnownName(value) {
+    const normalized = cleanCell(value);
+    const compact = normalized.replace(/\s+/g, '');
+    const knownNames = {
+        허희정신승도: '신승도 허희정',
+        신승도허희정: '신승도 허희정',
+        박현민이영미: '박현민 이영미',
+        남택주이기자: '남택주 이기자',
+        문헌주이예은: '문헌주 이예은'
+    };
+
+    return knownNames[compact] || normalized;
+}
+
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeSql(value) {
+    return cleanCell(value).replace(/'/g, "''");
 }
 
 // Express 설정을 내보냄

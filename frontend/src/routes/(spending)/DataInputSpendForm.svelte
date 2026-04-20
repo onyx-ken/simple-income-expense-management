@@ -3,6 +3,7 @@
 	import { createEventDispatcher } from 'svelte';
 	import { writable } from 'svelte/store';
 	import { accountsStore, accountsLoading } from '$lib/stores/accounts.js';
+	import BankExcelImport from '../(common)/BankExcelImport.svelte';
 	import _ from 'lodash';
 
 	export let skeletonCount = 10; // 로딩 중 표시할 스켈레톤 개수
@@ -23,6 +24,10 @@
 	let loading = true; // 로딩 상태
 
 	const dispatch = createEventDispatcher();
+
+	function handleBankDataImported(event) {
+		dispatch('dataAdded', event.detail);
+	}
 
 	$: accounts = $accountsStore;
 	$: loading = $accountsLoading;
@@ -108,6 +113,8 @@
 			console.error('추가 오류:', error);
 			alert('지출 데이터를 추가하는 중 오류가 발생했습니다.');
 		} finally {
+			// 데이터 추가 후 focus 적요로 이동
+			document.querySelector('input[placeholder="적요"]')?.focus();
 			resetForm();
 		}
 	}
@@ -164,6 +171,8 @@
 		inputSummary = suggestion; // 선택한 항목으로 설정
 		autocompleteSuggestions = []; // 자동완성 목록 숨김
 		showAutocomplete = false;
+		// focus 금액 필드로 이동
+		document.querySelector('input[placeholder="금액"]')?.focus();
 	}
 
 	// 키보드 이벤트 처리
@@ -273,7 +282,7 @@
 				bind:value={inputSummary}
 				on:keydown={handleNameInput}
 				on:keydown={handleInputKeydown}
-				on:blur={() => showAutocomplete = false}
+				on:blur={() => setTimeout(() => showAutocomplete = false, 100)}
 				placeholder="적요"
 				class="input input-bordered h-12 w-64 text-xl"
 			/>
@@ -283,12 +292,15 @@
 				<ul
 					class="autocomplete-list z-10 max-h-40 w-80 overflow-y-scroll border border-gray-300 bg-white rounded-md shadow-lg">
 					{#each autocompleteSuggestions as suggestion, index}
-						<li
-							class="autocomplete-item cursor-pointer px-4 py-2 hover:bg-gray-100"
-							class:selected={index === activeSuggestionIndex}
-							on:click={() => selectSuggestion(suggestion)}
-						>
-							{suggestion}
+						<li>
+							<button
+								type="button"
+								class="autocomplete-item cursor-pointer px-4 py-2 hover:bg-gray-100"
+								class:selected={index === activeSuggestionIndex}
+								on:click={() => selectSuggestion(suggestion)}
+							>
+								{suggestion}
+							</button>
 						</li>
 					{/each}
 				</ul>
@@ -325,6 +337,14 @@
 			<span class="text-center text-xl">천단위 자동 입력</span>
 		</div>
 	</div>
+
+	<BankExcelImport
+		targetType="spending"
+		title="지출 통장 엑셀 자동입력"
+		fieldLabel="적요"
+		textColor="text-red-700"
+		on:dataImported={handleBankDataImported}
+	/>
 </div>
 
 <style>
