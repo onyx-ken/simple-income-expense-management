@@ -96,10 +96,7 @@ app.get('/api/getIncomeData', async (req, res) => {
             queryStr += ` AND 날짜 <= #${end}#`;
         }
 
-        // 이름 조건
-        if (name) {
-            queryStr += ` AND 이름 LIKE '%${name}%'`; // LIKE 조건 추가
-        }
+        queryStr += buildTextSearchClause('이름', name);
 
         queryStr += ' ORDER BY 날짜, id';
 
@@ -208,10 +205,7 @@ app.get('/api/getSpendingData', async (req, res) => {
             queryStr += ` AND 날짜 <= #${end}#`;
         }
 
-        // 적요 조건
-        if (summary) {
-            queryStr += ` AND 적요 LIKE '%${summary}%'`; // LIKE 조건 추가
-        }
+        queryStr += buildTextSearchClause('적요', summary);
 
         queryStr += ' ORDER BY 날짜, id';
 
@@ -818,6 +812,46 @@ function processDescription(subject, description) {
         return description.replace(keywordRegex, '').trim();
     }
     return description; // 괄호가 없으면 기존 값 유지
+}
+
+function buildTextSearchClause(fieldName, rawQuery) {
+    const { includeTerms, excludeTerms } = parseTextSearchQuery(rawQuery);
+    const clauses = [];
+
+    for (const term of includeTerms) {
+        clauses.push(`${fieldName} LIKE '%${escapeSql(term)}%'`);
+    }
+
+    for (const term of excludeTerms) {
+        clauses.push(`(${fieldName} IS NULL OR ${fieldName} NOT LIKE '%${escapeSql(term)}%')`);
+    }
+
+    return clauses.length > 0 ? ` AND ${clauses.join(' AND ')}` : '';
+}
+
+function parseTextSearchQuery(rawQuery) {
+    const includeTerms = [];
+    const excludeTerms = [];
+    const query = cleanCell(rawQuery);
+    const tokenRegex = /(-?)"([^"]+)"|(-?)(\S+)/g;
+    let match;
+
+    while ((match = tokenRegex.exec(query)) !== null) {
+        const isExcluded = Boolean(match[1] || match[3]);
+        const term = cleanCell(match[2] || match[4]);
+
+        if (!term || term === '-') {
+            continue;
+        }
+
+        if (isExcluded) {
+            excludeTerms.push(term);
+        } else {
+            includeTerms.push(term);
+        }
+    }
+
+    return { includeTerms, excludeTerms };
 }
 
 function openExcelConnection(filePath) {

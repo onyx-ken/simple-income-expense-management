@@ -61,7 +61,7 @@
 		<input
 			type="text"
 			bind:value={textFilter}
-			placeholder={nameField + " 입력"}
+			placeholder={nameField + " 입력, -제외어"}
 			class="input input-bordered h-12 w-48 text-xl"
 		/>
 	</div>
