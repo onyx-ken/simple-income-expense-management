@@ -9,7 +9,6 @@ A simple **Electron** application built with **SvelteKit** for the frontend and 
 - **SvelteKit** for frontend (SPA mode)
 - **Express.js** for backend API
 - **Built-in routing & state management**
-- **Simple Ping API test (`/api/ping`)**
 - This project only ensures in a **Windows environment**
 
 ---
