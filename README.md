@@ -30,8 +30,12 @@ cd simple-income-expense-management
 ### 2️⃣ Install Dependencies
 
 ```sh
-npm install
+npm ci
+npm --prefix backend ci
+npm --prefix frontend ci
 ```
+
+Dependencies, generated builds, caches, IDE metadata, and local database backups are excluded from Git. Install dependencies for all three packages after cloning. Active MDB files and Excel import files remain tracked.
 
 ### 3️⃣ Run in Development Mode
 
